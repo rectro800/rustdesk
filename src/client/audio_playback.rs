@@ -78,6 +78,8 @@ pub(super) struct AudioPlaybackWriter {
     recovery: AudioPlaybackRecovery,
     pub(super) status: std::sync::Arc<AudioPlaybackStatus>,
     buffer_failed: bool,
+    resume_samples: usize,
+    starved: bool,
 }
 
 impl AudioPlaybackWriter {
@@ -97,6 +99,12 @@ impl AudioPlaybackWriter {
             recovery,
             status: Default::default(),
             buffer_failed: false,
+            resume_samples: super::audio_latency::duration_samples(
+                config.sample_rate,
+                config.channels,
+                super::audio_latency::RESUME_MS,
+            ),
+            starved: false,
         })
     }
 
@@ -120,7 +128,16 @@ impl AudioPlaybackWriter {
         };
         let generation = self.discontinuity_generation.load(Ordering::Relaxed);
         let channels = self.recovery.channels;
-        let samples = buffer.occupied_len().min(requested_samples) / channels * channels;
+        let queued = buffer.occupied_len();
+        let resume_samples = self
+            .resume_samples
+            .max(requested_samples)
+            .min(self.buffered_input.len());
+        if self.starved && queued < resume_samples {
+            return 0;
+        }
+        let samples = queued.min(requested_samples) / channels * channels;
+        self.starved = samples < requested_samples;
         buffer.pop_slice(&mut self.buffered_input[..samples]);
         drop(buffer);
         if generation != self.observed_discontinuity_generation {

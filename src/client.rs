@@ -93,8 +93,11 @@ use crate::ui_session_interface::SessionPermissionConfig;
 
 pub use super::lang::*;
 
+mod audio_latency;
 #[cfg(not(target_os = "linux"))]
 mod audio_playback;
+#[cfg(target_os = "linux")]
+mod audio_playback_pulse;
 #[cfg(target_os = "windows")]
 mod audio_playback_recovery;
 #[cfg(all(test, not(target_os = "linux")))]
@@ -2141,7 +2144,7 @@ impl ClientClipboardHandler {
 pub struct AudioHandler {
     audio_decoder: Option<(AudioDecoder, Vec<f32>)>,
     #[cfg(target_os = "linux")]
-    simple: Option<psimple::Simple>,
+    simple: Option<audio_playback_pulse::PulsePlayback>,
     #[cfg(not(target_os = "linux"))]
     audio_buffer: AudioBuffer,
     #[cfg(not(target_os = "linux"))]
@@ -2209,8 +2212,7 @@ fn prepare_decoded_audio(
 #[cfg(not(target_os = "linux"))]
 struct AudioBuffer(
     pub Arc<std::sync::Mutex<ringbuf::HeapRb<f32>>>,
-    usize,
-    [usize; 30],
+    audio_latency::PlaybackLatency,
     Arc<std::sync::atomic::AtomicUsize>,
 );
 
@@ -2221,8 +2223,7 @@ impl Default for AudioBuffer {
             Arc::new(std::sync::Mutex::new(
                 ringbuf::HeapRb::<f32>::new(48000 * 2 * AUDIO_BUFFER_MS / 1000), // 48000hz, 2 channel
             )),
-            48000 * 2,
-            [0; 30],
+            Default::default(),
             Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         )
     }
@@ -2235,78 +2236,32 @@ impl AudioBuffer {
         let old_capacity = self.0.lock().unwrap().capacity();
         if capacity != old_capacity {
             *self.0.lock().unwrap() = ringbuf::HeapRb::<f32>::new(capacity);
-            self.1 = sample_rate * channels;
             log::info!("Audio buffer resized from {old_capacity} to {capacity}");
         }
+        self.1 = audio_latency::PlaybackLatency::new(sample_rate as _, channels);
     }
 
-    fn try_shrink(&mut self, having: usize) {
-        extern crate chrono;
-        use chrono::prelude::*;
-
-        let mut i = (having * 10) / self.1;
-        if i > 29 {
-            i = 29;
-        }
-        self.2[i] += 1;
-
-        #[allow(non_upper_case_globals)]
-        static mut tms: i64 = 0;
-        let dt = Local::now().timestamp_millis();
-        unsafe {
-            if tms == 0 {
-                tms = dt;
-                return;
-            } else if dt < tms + 12000 {
-                return;
-            }
-            tms = dt;
-        }
-
-        // the safer water mark to drop
-        let mut zero = 0;
-        // the water mark taking most of time
-        let mut max = 0;
-        for i in 0..30 {
-            if self.2[i] == 0 && zero == i {
-                zero += 1;
-            }
-
-            if self.2[i] > self.2[max] {
-                self.2[max] = 0;
-                max = i;
-            } else {
-                self.2[i] = 0;
-            }
-        }
-        zero = zero * 2 / 3;
-
-        // how many data can be dropped:
-        // 1. will not drop if buffered data is less than 600ms
-        // 2. choose based on min(zero, max)
-        const N: usize = 4;
-        self.2[max] = 0;
-        if max < 6 {
-            return;
-        } else if max > zero * N {
-            max = zero * N;
-        }
-
+    /// Drops the oldest queued PCM so at most `keep` samples remain.
+    fn discard_queued(&self, keep: usize) {
         let mut lock = self.0.lock().unwrap();
-        let cap = lock.capacity();
-        let having = lock.occupied_len();
-        let skip = (cap * max / (30 * N) + 1) & (!1);
-        if (having > skip * 3) && (skip > 0) {
-            lock.skip(skip);
-            let generation = self.signal_discontinuity();
-            drop(lock);
-            log::info!("skip {skip}, based {max} {zero}, generation={generation}");
+        let queued = lock.occupied_len();
+        if queued <= keep {
+            return;
         }
+        lock.skip(queued - keep);
+        let generation = self.signal_discontinuity();
+        drop(lock);
+        hbb_common::throttled_log!(
+            audio_playback::AUDIO_PLAYBACK_LOG_INTERVAL,
+            info,
+            "Audio playback resynced after a stall: dropped {} samples, generation={generation}",
+            queued - keep
+        );
     }
 
     /// The caller must hold the PCM buffer lock while signaling the discard.
     fn signal_discontinuity(&self) -> usize {
-        self.3
+        self.2
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             .wrapping_add(1)
     }
@@ -2332,21 +2287,22 @@ impl AudioBuffer {
         occupied
     }
 
-    /// append pcm to audio buffer, trying to drop data
-    /// when data is too much (per 12 seconds) based
-    /// statistics.
+    /// append pcm to audio buffer, keeping the queued audio
+    /// close to real time after stalls and clock drift.
     pub fn append_pcm(&mut self, buffer: &[f32]) {
-        let having = self.append_pcm2(buffer);
-        self.try_shrink(having);
+        let queued = self.0.lock().unwrap().occupied_len();
+        let plan = self.1.plan(queued, buffer);
+        if let Some(keep) = plan.keep_queued {
+            self.discard_queued(keep);
+        }
+        self.append_pcm2(self.1.chunk(buffer, &plan));
     }
 }
 
 impl AudioHandler {
     #[cfg(target_os = "linux")]
     fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
-        use psimple::Simple;
         use pulse::sample::{Format, Spec};
-        use pulse::stream::Direction;
 
         let spec = Spec {
             format: Format::F32le,
@@ -2357,16 +2313,7 @@ impl AudioHandler {
             bail!("Invalid audio format");
         }
 
-        self.simple = Some(Simple::new(
-            None,                   // Use the default server
-            &crate::get_app_name(), // Our application’s name
-            Direction::Playback,    // We want a playback stream
-            None,                   // Use the default device
-            "playback",             // Description of our stream
-            &spec,                  // Our sample format
-            None,                   // Use default channel map
-            None,                   // Use default buffering attributes
-        )?);
+        self.simple = Some(audio_playback_pulse::PulsePlayback::new(spec)?);
         self.sample_rate = (format0.sample_rate, format0.sample_rate);
         Ok(())
     }
@@ -2546,11 +2493,7 @@ impl AudioHandler {
                 self.audio_buffer.append_pcm(&buffer);
             }
             #[cfg(target_os = "linux")]
-            {
-                let data_u8 =
-                    unsafe { std::slice::from_raw_parts::<u8>(buffer.as_ptr() as _, n * 4) };
-                self.simple.as_mut().map(|x| x.write(data_u8));
-            }
+            self.simple.as_mut().map(|x| x.push(&buffer[0..n]));
         });
     }
 
@@ -2572,7 +2515,7 @@ impl AudioHandler {
         self.audio_buffer
             .resize(config.sample_rate.0 as _, config.channels as _);
         let audio_buffer = self.audio_buffer.0.clone();
-        let discontinuity_generation = self.audio_buffer.3.clone();
+        let discontinuity_generation = self.audio_buffer.2.clone();
         let mut playback_writer = audio_playback::AudioPlaybackWriter::new(
             audio_playback::AudioPlaybackConfig {
                 sample_rate: config.sample_rate.0,

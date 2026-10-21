@@ -40,6 +40,40 @@ fn writing_audio_observes_discard_and_releases_buffer_lock() {
     assert_eq!(buffer.try_lock().unwrap().occupied_len(), 0);
 }
 
+#[test]
+fn underrun_waits_for_a_cushion_instead_of_stuttering_per_packet() {
+    let packet = ACTIVE_FRAME.repeat(SAMPLE_RATE as usize / 100);
+    let resume_samples = super::super::audio_latency::duration_samples(
+        SAMPLE_RATE,
+        CHANNELS,
+        super::super::audio_latency::RESUME_MS,
+    );
+    let buffer = Arc::new(Mutex::new(ringbuf::HeapRb::new(SAMPLE_RATE as usize * CHANNELS)));
+    let generation = Arc::new(super::AtomicUsize::new(0));
+    let config = AudioPlaybackConfig {
+        sample_rate: SAMPLE_RATE,
+        channels: CHANNELS,
+    };
+    let mut writer = AudioPlaybackWriter::new(config, buffer.clone(), generation).unwrap();
+    let mut output = [0.0_f32; 64];
+    writer.write_output(&mut output);
+
+    buffer.lock().unwrap().push_slice(&packet);
+    writer.write_output(&mut output);
+    assert_eq!(output, [0.0; 64]);
+    assert_eq!(buffer.lock().unwrap().occupied_len(), packet.len());
+
+    while buffer.lock().unwrap().occupied_len() < resume_samples {
+        buffer.lock().unwrap().push_slice(&packet);
+    }
+    writer.write_output(&mut output);
+    assert_ne!(output, [0.0; 64]);
+    assert_eq!(
+        buffer.lock().unwrap().occupied_len(),
+        resume_samples - output.len()
+    );
+}
+
 fn maximum_sample_step(samples: &[f32]) -> f32 {
     samples
         .windows(CHANNELS + 1)
