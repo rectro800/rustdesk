@@ -1,4 +1,4 @@
-use super::audio_latency::{self, PlaybackLatency};
+use super::audio_latency::{self, PlaybackFeedback, PlaybackLatency};
 use hbb_common::{log, ResultType};
 use pulse::{def::BufferAttr, sample::Spec, stream::Direction};
 use std::{
@@ -41,6 +41,7 @@ pub(super) struct PulsePlayback {
 impl PulsePlayback {
     pub(super) fn new(spec: Spec) -> ResultType<Self> {
         let latency = PlaybackLatency::new(spec.rate, spec.channels as _);
+        let feedback = latency.feedback();
         let shared = Arc::new(Shared::default());
         let writer_shared = shared.clone();
         let (started_tx, started_rx) = mpsc::channel();
@@ -57,7 +58,7 @@ impl PulsePlayback {
                         return;
                     }
                 };
-                write_queue(&writer_shared, &simple, &spec);
+                write_queue(&writer_shared, &simple, &spec, &feedback);
             })?;
         started_rx.recv()??;
         Ok(Self { shared, latency })
@@ -115,13 +116,15 @@ fn open_stream(spec: &Spec) -> ResultType<psimple::Simple> {
 
 /// Writes the queue to the server in fixed chunks, padding with silence while it is short so the
 /// server clock, not packet arrival, paces playback.
-fn write_queue(shared: &Shared, simple: &psimple::Simple, spec: &Spec) {
+fn write_queue(
+    shared: &Shared,
+    simple: &psimple::Simple,
+    spec: &Spec,
+    feedback: &PlaybackFeedback,
+) {
     let channels = usize::from(spec.channels).max(1);
     let chunk_samples =
         audio_latency::duration_samples(spec.rate, channels, WRITE_CHUNK_MS).max(channels);
-    let resume_samples =
-        audio_latency::duration_samples(spec.rate, channels, audio_latency::RESUME_MS)
-            .max(chunk_samples);
     let mut output = vec![0.0_f32; chunk_samples];
     let mut declick = Declick::new(spec.rate, channels);
     let mut starved = true;
@@ -132,14 +135,18 @@ fn write_queue(shared: &Shared, simple: &psimple::Simple, spec: &Spec) {
                 declick.begin_discontinuity();
             }
             let queued = queue.samples.len();
-            if starved && queued < resume_samples {
+            if starved && queued < feedback.resume_samples().max(chunk_samples) {
                 0
             } else {
                 let available = queued.min(chunk_samples) / channels * channels;
                 for (slot, sample) in output.iter_mut().zip(queue.samples.drain(..available)) {
                     *slot = sample;
                 }
-                starved = available < chunk_samples;
+                let ran_dry = available < chunk_samples;
+                if ran_dry && !starved && declick.is_audible() {
+                    feedback.report_underrun();
+                }
+                starved = ran_dry;
                 available
             }
         };
@@ -179,6 +186,12 @@ impl Declick {
             transition_start: vec![0.0; channels],
             last_output: vec![0.0; channels],
         }
+    }
+
+    fn is_audible(&self) -> bool {
+        self.last_output
+            .iter()
+            .any(|sample| sample.abs() >= audio_latency::QUIET_PEAK)
     }
 
     fn begin_discontinuity(&mut self) {

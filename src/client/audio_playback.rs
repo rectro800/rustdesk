@@ -80,6 +80,7 @@ pub(super) struct AudioPlaybackWriter {
     buffer_failed: bool,
     resume_samples: usize,
     starved: bool,
+    latency_feedback: Option<std::sync::Arc<super::audio_latency::PlaybackFeedback>>,
 }
 
 impl AudioPlaybackWriter {
@@ -105,7 +106,16 @@ impl AudioPlaybackWriter {
                 super::audio_latency::RESUME_MS,
             ),
             starved: false,
+            latency_feedback: None,
         })
+    }
+
+    pub(super) fn with_latency_feedback(
+        mut self,
+        feedback: std::sync::Arc<super::audio_latency::PlaybackFeedback>,
+    ) -> Self {
+        self.latency_feedback = Some(feedback);
+        self
     }
 
     fn read_buffer(&mut self, requested_samples: usize) -> usize {
@@ -130,14 +140,22 @@ impl AudioPlaybackWriter {
         let channels = self.recovery.channels;
         let queued = buffer.occupied_len();
         let resume_samples = self
-            .resume_samples
+            .latency_feedback
+            .as_ref()
+            .map_or(self.resume_samples, |feedback| feedback.resume_samples())
             .max(requested_samples)
             .min(self.buffered_input.len());
         if self.starved && queued < resume_samples {
             return 0;
         }
         let samples = queued.min(requested_samples) / channels * channels;
-        self.starved = samples < requested_samples;
+        let starved = samples < requested_samples;
+        if starved && !self.starved && self.recovery.is_audible() {
+            if let Some(feedback) = &self.latency_feedback {
+                feedback.report_underrun();
+            }
+        }
+        self.starved = starved;
         buffer.pop_slice(&mut self.buffered_input[..samples]);
         drop(buffer);
         if generation != self.observed_discontinuity_generation {
@@ -220,6 +238,12 @@ impl AudioPlaybackRecovery {
                 self.transition_start[channel] * (1.0 - target_weight) + target * target_weight;
         }
         Ok(&self.output_frame)
+    }
+
+    fn is_audible(&self) -> bool {
+        self.output_frame
+            .iter()
+            .any(|sample| sample.abs() >= super::audio_latency::QUIET_PEAK)
     }
 
     pub(super) fn begin_discontinuity(&mut self) {

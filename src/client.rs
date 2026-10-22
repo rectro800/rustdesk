@@ -2523,7 +2523,8 @@ impl AudioHandler {
             },
             audio_buffer,
             discontinuity_generation,
-        )?;
+        )?
+        .with_latency_feedback(self.audio_buffer.1.feedback());
         let playback_status = playback_writer.status.clone();
         let timeout = None;
         let stream = device.build_output_stream(
