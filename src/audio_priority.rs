@@ -13,7 +13,7 @@ pub fn raise_current_thread() {
         return;
     }
     if let Err(err) = raise() {
-        log::info!("Audio thread keeps its normal priority: {err}");
+        hbb_common::log::info!("Audio thread keeps its normal priority: {err}");
     }
 }
 
