@@ -48,6 +48,7 @@ impl PulsePlayback {
         std::thread::Builder::new()
             .name("audio-playback".to_owned())
             .spawn(move || {
+                crate::audio_priority::raise_current_thread();
                 let simple = match open_stream(&spec) {
                     Ok(simple) => {
                         started_tx.send(Ok(())).ok();

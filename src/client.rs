@@ -2530,6 +2530,7 @@ impl AudioHandler {
         let stream = device.build_output_stream(
             config,
             move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+                crate::audio_priority::raise_current_thread();
                 playback_writer.write_output(data);
             },
             err_fn,
@@ -4079,6 +4080,7 @@ pub fn start_video_thread<F, T>(
 pub fn start_audio_thread() -> MediaSender {
     let (audio_sender, audio_receiver) = mpsc::channel::<MediaData>();
     std::thread::spawn(move || {
+        crate::audio_priority::raise_current_thread();
         let mut audio_handler = AudioHandler::default();
         loop {
             #[cfg(target_os = "windows")]

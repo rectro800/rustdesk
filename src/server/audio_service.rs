@@ -95,6 +95,7 @@ mod pa_impl {
 
     #[tokio::main(flavor = "current_thread")]
     pub async fn run(sp: EmptyExtraFieldService) -> ResultType<()> {
+        crate::audio_priority::raise_current_thread();
         hbb_common::sleep(0.1).await; // one moment to wait for _pa ipc
         RESTARTING.store(false, Ordering::SeqCst);
         // The `_pa` ipc is served by the cm, which is not started at a login
@@ -592,6 +593,7 @@ mod cpal_impl {
         let stream = device.build_input_stream(
             &config.config(),
             move |data: &[T], _: &InputCallbackInfo| {
+                crate::audio_priority::raise_current_thread();
                 if processor_errors.needs_restart() {
                     return;
                 }

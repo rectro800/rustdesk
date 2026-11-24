@@ -279,7 +279,10 @@ pub(super) fn start_capture_encoder(
     };
     let handle = std::thread::Builder::new()
         .name(CAPTURE_ENCODER_THREAD_NAME.to_owned())
-        .spawn(move || encoder::run_capture_encoder(context, config))
+        .spawn(move || {
+            crate::audio_priority::raise_current_thread();
+            encoder::run_capture_encoder(context, config)
+        })
         .with_context(|| "Failed to start audio encoder thread")?;
     let wake_thread = handle.thread().clone();
     let worker = CaptureEncoderWorker {

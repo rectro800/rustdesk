@@ -1,3 +1,4 @@
+mod audio_priority;
 #[cfg(any(test, not(target_os = "linux")))]
 mod audio_resampler;
 mod keyboard;
